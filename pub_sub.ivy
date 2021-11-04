@@ -7,18 +7,26 @@ include collections
 
 # Types.
 global {
-    # Key type used to identify pub/sub channels.
-    instance key_t : iterable
-
-    # Value type used in channels.
-    alias byte = uint[8]
-    alias val_t = byte
-    instance log_t : vector(val_t)
-
     # IDs for different processes.
     instance client_id : iterable
     instance server_id : iterable
     instance manager_id : iterable
+
+    # Key type used to identify pub/sub channels.
+    instance key_t : iterable
+
+    # Value types used in channels.
+    alias byte = uint[8]
+    alias data_t = byte
+    class val_t = {
+        field data : data_t
+        field src : client_id
+    }
+    instance log_t : vector(val_t)
+
+    # Specification types.
+    instance pub_id : iterable
+    instance commit_id : iterable
 }
 
 process client (self:client_id) = {
@@ -36,27 +44,36 @@ process client (self:client_id) = {
     export action publish_req(key:key_t,val:val_t)
     # Callback to notify clients when a value has been published to a key they've 
     # subscribed to. This includes values published by themself.
-    import action publish_rsp(key:key_t,val:val_t,src:client_id)
-
-    specification {
-    }
+    import action publish_rsp(key:key_t,val:val_t)
 
     common {
 
         specification {
 
-            var pending_subscribe(X:client_id,K:key_t) : bool   # a subscribe is pending for this key
-            var subscribed(X:client_id,K:key_t) : bool          # this client is subscribed to this key
-            # all the pending values published by this client to this key
-            instance pending_pubs(X:client_id,K:key_t) : unbounded_queue(val_t)  
+            var pending_subscribe(X:client_id,K:key_t) : bool           # a subscribe is pending for this key
+            var subscribed(X:client_id,K:key_t) : bool                  # this client is subscribed to this key
+            var n_commits(X:client_id,K:key_t) : commit_id              # the number of messages seen by this client
+            var commit_order(X:client_id,K:key_t,C:commit_id) : val_t   # the commit order seen by each client to each key
+            var n_pubs(X:client_id,K:key_t) : pub_id                    # the number of publications by this client
+            var pending_pub(X:client_id,K:key_t,P:pub_id) : bool        # does a client have a pending publication for this?
+            var pending_pub_val(X:client_id,K:key_t,P:pub_id) : val_t   # all the pending values published by each client to each key
+
+            # Checks if a commit is consistent with our requirements.
+            function valid_commit(K:key_t,C:commit_id,V:val_t) =
+                                # The commit must agree with other clients' orders for this key.
+                                (forall X:client_id. n_commits(X,K) > C -> commit_order(X,K,C) = V) &
+                                # The commit must have come from somewhere.
+                                (exists X:client_id,P:pub_id. (n_commits(X,K) > C & V.src = X) | 
+                                                              (pending_pub(X,K,P) & pending_pub_val(X,K,P) = V))
 
             after init {
                 pending_subscribe(X,K) := false;
                 subscribed(X,K) := false;
-                # TODO: initialize any state
+                n_commits(X,K) := 0;
+                n_pubs(X,K) := 0;
             }
 
-            before subscribe_req(self:client_id,key:key_t,val:val_t) {
+            before subscribe_req(self:client_id,key:key_t) {
                 require ~pending_subscribe(self,key) & ~subscribed(self,key);
                 pending_subscribe(self,key) := true;
             }
@@ -65,25 +82,46 @@ process client (self:client_id) = {
                 require pending_subscribe(self,key);
                 pending_subscribe(self,key) := false;
                 subscribed(self,key) := true;
-                # TODO do something with content received
+                # Add all entries to this client's observed commit order, 
+                # and check that they match other clients'.
+                var i : index; i := 0;
+                var c : commit_id; c := 0;
+                while i < content.end {
+                    var val := content.get(i);
+                    require valid_commit(key,c,val);
+                    commit_order(self,key,c) := val;
+                    i := i.next; c := c.next;
+                }
+                n_commits(self,key) := c;
             }
 
             before publish_req(self:client_id,key:key_t,val:val_t) {
                 require subscribed(self,key);
-                pending_pubs(self,key).enqueue(val);
-                # TODO do something with published value
+                var p := n_pubs(self,key);
+                pending_pub(self,key,p) := true;
+                pending_pub_val(self,key,p) := val;
+                n_pubs(self,key) := p.next;
             }
 
-            before publish_rsp(self:client_id,key:key_t,val:val_t,src:client_id) {
+            before publish_rsp(self:client_id,key:key_t,val:val_t) {
                 require subscribed(self,key);
                 # Check that clients see sequential consistency for their own publications.
-                if src = self {
-                    require ~pending_pubs(self,key).empty &
-                             pending_pubs(self,key).dequeue = val;
+                if val.src = self {
+                    var p := n_pubs(self,key);
+                    # There must be a pending publish whose value must match this value, 
+                    # which has no previous pending publishes, and all further pub_ids are pending.
+                    require exists P:pub_id. pending_pub(self,key,P) & pending_pub_val(self,key,P) = val &
+                                             forall Q. (Q < P -> ~pending_pub(self,key,Q)) & 
+                                                       ((Q > P & Q < p) -> pending_pub(self,key,Q));
+                    pending_pub(self,key,p) := false;
+                    n_pubs(self,key) := p.next;
                 }
-                # TODO check that the history is linearizable (or something similar)
+                # Keep track of this publication, and make sure it matches other clients.
+                var c := n_commits(self,key);
+                require valid_commit(key,c,val);
+                commit_order(self,key,c) := val;
+                n_commits(self,key) := c.next;
             }
         }
     }
 }
-
