@@ -50,9 +50,9 @@ process client (self:client_id) = {
     # subscribed to. This includes values published by themself.
     import action publish_rsp(key:key_t,val:val_t)
 
-    common {
+    specification {
 
-        specification {
+        common {
 
             var pending_subscribe(X:client_id,K:key_t) : bool           # a subscribe is pending for this key
             var pending_unsubscribe(X:client_id,K:key_t) : bool         # an unsubscribe is pending for this key
@@ -94,7 +94,8 @@ process client (self:client_id) = {
                 # and check that they match other clients'.
                 var i : index; i := 0;
                 var c : commit_id; c := 0;
-                while i < content.end {
+                while i < content.end
+                decreases content.end - i {
                     var val := content.get(i);
                     require valid_commit(key,c,val);
                     commit_order(self,key,c) := val;
@@ -146,6 +147,100 @@ process client (self:client_id) = {
                 commit_order(self,key,c) := val;
                 n_commits(self,key) := c.next;
             }
+        }
+    }
+
+    implementation {
+
+        common {
+
+            # Clients and servers communicate using these message kinds:
+            type msg_kind = {
+                sub_req_kind,   # subscribe request
+                sub_rsp_kind,   # subscribe response
+                unsub_req_kind, # unsubscribe request
+                unsub_rsp_kind, # unsubscribe response
+                pub_req_kind,   # publish request
+                pub_rsp_kind    # publish response
+            }
+
+            # Message class for client-server messages.
+            class msg_t = {
+                field kind : msg_kind   # kind of message
+                field key : key_t       # key to operate on
+                field val : val_t       # value, if any
+                field log : log_t       # result of a subscribe request
+            }
+
+            # Network for client-server messages.
+            instance net : tcp.net(msg_t)
+
+            # Management messages have the following structure:
+            class man_msg_t = {
+
+            }
+
+            # Network for management messages.
+            instance man_net : tcp.net(man_msg_t)
+
+            process manager(self:manager_id) = {
+                instance sock : man_net.socket
+
+                implement sock.recv(src:tcp.endpoint,msg:man_msg_t) {
+
+                }
+            }
+
+            process server(self:server_id) = {
+                # Server network sockets.
+                instance sock : net.socket
+                instance man_sock : man_net.socket
+
+                # Server state.
+
+
+                implement sock.recv(src:tcp.endpoint,msg:msg_t) {
+                    
+                }
+
+                implement man_sock.recv(src:tcp.endpoint,msg:man_msg_t) {
+                    
+                }
+            }
+        }
+
+        #
+        # Client implementation.
+        #
+
+        # Cliet network sockets.
+        instance sock : net.socket
+        instance man_sock : man_net.socket
+
+        implement subscribe_req {
+            
+        }
+
+        implement unsubscribe_req {
+
+        }
+
+        implement publish_req {
+
+        }
+
+        implement sock.recv(src:tcp.endpoint,msg:msg_t) {
+            if msg.kind = sub_rsp_kind {
+                subscribe_rsp(msg.key,msg.log);
+            } else if msg.kind = unsub_rsp_kind {
+                unsubscribe_rsp(msg.key);
+            } else if msg.kind = pub_rsp_kind {
+                publish_rsp(msg.key,msg.val);
+            }
+        }
+
+        implement man_sock.recv(src:tcp.endpoint,msg:man_msg_t) {
+
         }
     }
 }
