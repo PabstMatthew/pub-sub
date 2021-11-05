@@ -33,11 +33,15 @@ process client (self:client_id) = {
 
     # Subscribe to a particular key.
     export action subscribe_req(key:key_t)
-    # In response,receive `content`, a log of all previous messages for this key.
+    # In response, receive `content`, a log of all previous messages for this key.
     # Once this message is received,the client will also receive `publish_rsp`
     # when values are published to this key.
     import action subscribe_rsp(key:key_t,content:log_t)
-    # TODO add unsubscribe action
+
+    # Unsubscribe from a subscribed channel.
+    export action unsubscribe_req(key:key_t)
+    # In response, receive a notification that no more publishes will be sent.
+    import action unsubscribe_rsp(key:key_t)
 
     # Publish a value to this key. Expected to only be called after a corresponding 
     # `subscribe_req` and `subscribe_rsp`.
@@ -51,6 +55,7 @@ process client (self:client_id) = {
         specification {
 
             var pending_subscribe(X:client_id,K:key_t) : bool           # a subscribe is pending for this key
+            var pending_unsubscribe(X:client_id,K:key_t) : bool         # an unsubscribe is pending for this key
             var subscribed(X:client_id,K:key_t) : bool                  # this client is subscribed to this key
             var n_commits(X:client_id,K:key_t) : commit_id              # the number of messages seen by this client
             var commit_order(X:client_id,K:key_t,C:commit_id) : val_t   # the commit order seen by each client to each key
@@ -74,11 +79,14 @@ process client (self:client_id) = {
             }
 
             before subscribe_req(self:client_id,key:key_t) {
+                # Client must only have one pending subscribe per key, 
+                # and must not currently be subscribed to this key.
                 require ~pending_subscribe(self,key) & ~subscribed(self,key);
                 pending_subscribe(self,key) := true;
             }
 
             before subscribe_rsp(self:client_id,key:key_t,content:log_t) {
+                # Client must have requested this subscription.
                 require pending_subscribe(self,key);
                 pending_subscribe(self,key) := false;
                 subscribed(self,key) := true;
@@ -95,7 +103,22 @@ process client (self:client_id) = {
                 n_commits(self,key) := c;
             }
 
+            before unsubscribe_req(self:client_id,key:key_t) {
+                # Client must only have one pending unsubcribe per key, 
+                # and must currently be subscribed to this key.
+                require ~pending_unsubscribe(self,key) & subscribed(self,key);
+                pending_unsubscribe(self,key) := true;
+            }
+
+            before unsubscribe_rsp(self:client_id,key:key_t) {
+                # Client must have requested this unsubscription.
+                require pending_unsubscribe(self,key);
+                pending_unsubscribe(self,key) := false;
+                subscribed(self,key) := false;
+            }
+
             before publish_req(self:client_id,key:key_t,val:val_t) {
+                # Client must be subscribed before it can publish.
                 require subscribed(self,key);
                 var p := n_pubs(self,key);
                 pending_pub(self,key,p) := true;
@@ -104,6 +127,7 @@ process client (self:client_id) = {
             }
 
             before publish_rsp(self:client_id,key:key_t,val:val_t) {
+                # Client must still be subscribed to this key.
                 require subscribed(self,key);
                 # Check that clients see sequential consistency for their own publications.
                 if val.src = self {
