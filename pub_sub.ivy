@@ -1,9 +1,17 @@
 #lang ivy1.8
 
+# STL
 include numbers
 include network
 include order
 include collections
+include timeout
+
+# Project-specific
+include shard
+include table
+include delmap
+include multi_paxos
 
 # Types.
 global {
@@ -154,6 +162,18 @@ process client (self:client_id) = {
 
         common {
 
+            # This type represents a range of keys and a list of key/value pairs in that range.
+            global {
+                instance shard_t : table_shard(key_t,log_t)
+            }
+
+            # Describes a key's configuration.
+            class config = {
+                field primary : server_id   # the primary server for this key
+                field secondary : server_id # the secondary server for this key
+                field replicating : bool    # is this key being replicated? i.e. is it safe to serve requests?
+            }
+
             # Clients and servers communicate using these message kinds:
             type msg_kind = {
                 sub_req_kind,   # subscribe request
@@ -177,19 +197,137 @@ process client (self:client_id) = {
 
             # Management messages have the following structure:
             class man_msg_t = {
-
+                field view : nat            # view number (indicates configuration version)
+                field lo : key_t.iter.t     # lower bound of key range
+                field hi : key_t.iter.t     # upper bound of key range
+                field primary : server_id   # primary server id, if any
+                field secondary : server_id # secondary server id, if any
+                field src : server_id       # pinging server id, if any
             }
 
             # Network for management messages.
             instance man_net : tcp.net(man_msg_t)
 
             process manager(self:manager_id) = {
+
+                # Manager state.
+                var view : nat                  # the current view number
+                var time : nat                  # the current time (in seconds)
+                var heard(S:server_id) : nat    # last time we heard from server S
+                var proposed : bool             # have we proposed a new view?
+                instance confmap : delegation_map(key_t,config)    # stores configuration for each key
+
+                common {
+                    # Server failure timeout, can be overridden on command line.
+                    parameter fail_time : nat = 2
+                    # Paxos decides on this operation, but can optionally decide nothing.
+                    instance op_t : option(man_msg_t)
+                }
+
+                # Manager's socket on management network.
                 instance sock : man_net.socket
 
-                implement sock.recv(src:tcp.endpoint,msg:man_msg_t) {
+                # A timer that ticks once a second.
+                instance timer : timeout_sec
 
+                after init {
+                    view := 0;
+                    time := 0;
+                    proposed := false;
+                    var conf : config;
+                    conf.primary := 0;
+                    conf.secondary := 1;
+                    conf.replicating := false;
+                    confmap.set(key_t.iter.begin,key_t.iter.end,conf);
                 }
-            }
+
+                # A server is up if we've heard from it in the last `fail_time` seconds.
+                function is_up(S:server_id) = time <= heard(S) + fail_time
+
+                # Managers take commands to assign a range of keys `[lo,hi)` to a given primary and secondary.
+                export action assign(lokey:key_t,hikey:key_t,primary:server_id,secondary:server_id) = {
+                    if primary ~= secondary {
+                        announce(view+1, key_t.iter.create(lokey), key_t.iter.create(hikey), primary, secondary);
+                    }
+                }
+
+                # Propose a view change to Paxos. The view change will only be broadcast once decided by Paxos.
+                action announce(view:nat,lo:key_t.iter.t,hi:key_t.iter.t,primary:server_id,secondary:server_id) = {
+                    if ~proposed {
+                        var msg : man_msg_t;
+                        msg.view := view;
+                        msg.lo := lo;
+                        msg.hi := hi;
+                        msg.primary := primary;
+                        msg.secondary := secondary;
+                        # Ask paxos to agree on our view change.
+                        paxos.server.propose(client.manager.op_t.just(msg));
+                        proposed := true;
+                    }
+                }
+
+                # On a callback from Paxos, execute the view change.
+                implement paxos.server.decide(inst:paxos.instance_t,op:op_t) {
+                    proposed := false;
+                    # Check that Paxos actually decided something.
+                    if ~op.is_empty {
+                        var msg := op.contents;
+                        var conf : config;
+                        conf.primary := msg.primary;
+                        conf.secondary := msg.secondary;
+                        var hi := msg.hi;
+                        # Iterate over all shards in this range, and re-assign them.
+                        while msg.lo < hi {
+                            msg.hi := hi;
+                            var lub := confmap.lub(msg.lo.next);
+                            if lub < msg.hi {
+                                msg.hi := lub;
+                            }
+                            assign_in_steps(msg);
+                            confmap.set(msg.lo,msg.hi,conf);
+                            msg.lo := msg.hi;
+                        }
+                    }
+                }
+
+                # Each view change is done in two steps to enable asynchrony:
+                # 1. Make the new primary secondary.
+                # 2. Make the secondary primary and replicate to new secondary.
+                # The first step is only necessary if both the primary and secondary are changing.
+                action assign_in_steps(msg:man_msg_t) = {
+                    var old_config := confmap.get(msg.lo.val);
+                    if old_config.primary ~= msg.primary & old_config.secondary ~= msg.primary {
+                        var pmsg := msg;
+                        pmsg.primary := old_config.primary;
+                        pmsg.secondary := msg.primary;
+                        broadcast(pmsg);
+                    }
+                    broadcast(msg);
+                }
+
+                # Broadcasts a new view message to all clients and servers.
+                action broadcast(msg:man_msg_t) = {
+                    view := view.next;
+                    msg.view := view;
+                    for it,cl in client_id.iter {
+                        sock.send(client(cl).man_sock.id,msg);
+                    }
+                    for it,sv in server_id.iter {
+                        sock.send(server(sv).man_sock.id,msg);
+                    }
+                }
+
+                # Record time from server ping messages.
+                implement sock.recv(src:tcp.endpoint,msg:man_msg_t) {
+                    if msg.view = view {
+                        heard(msg.src) := time;
+                    }
+                }
+
+                # Paxos instantation.
+                instance paxos : multi_paxos(manager_id,client.manager.op_t,client.manager.op_t.empty)
+
+            } with client.manager.paxos.nset, manager.paxos.nset.api, manager.paxos.nset.majorities_intersect, client.manager.paxos.round_t, client.manager.paxos.instance_t, vector[client.manager.paxos.vote_t], client.manager.paxos, client.manager.paxos.server, nat
 
             process server(self:server_id) = {
                 # Server network sockets.
@@ -212,6 +350,9 @@ process client (self:client_id) = {
         #
         # Client implementation.
         #
+
+        # Client state.
+        #instance confmap : delegation_map(key_t,config)
 
         # Cliet network sockets.
         instance sock : net.socket
