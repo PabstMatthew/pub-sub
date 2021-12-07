@@ -5,7 +5,7 @@ OBJS:=$(patsubst %.ivy,%,$(SRCS))
 default: $(OBJS)
 
 %: %.ivy
-	ivyc $<
+	ivyc target=test $<
 
 clean:
 	find . -type f -executable -delete

@@ -13,6 +13,9 @@ include table
 include delmap
 include multi_paxos
 
+# TODO: timeout mechanism, publishes
+include timeout
+
 # Types.
 global {
     # IDs for different processes.
@@ -30,7 +33,16 @@ global {
         field data : data_t
         field src : client_id
     }
-    instance log_t : vector(val_t)
+    instance log_t : vector(val_t)  # a history of channel messages
+    instance client_list : vector(client_id)
+    #instance clientset(C:client_id)
+
+    # Channel state.
+    class channel_t = {
+        field log : log_t # channel message history
+        #field client_subscribed(C:client_id) : bool # set of clients subscribed to this channel
+        field clients_subscribed : client_list # list of clients subscribed to this channel
+    }
 
     # Specification types.
     instance pub_id : iterable
@@ -164,7 +176,7 @@ process client (self:client_id) = {
 
             # This type represents a range of keys and a list of key/value pairs in that range.
             global {
-                instance shard_t : table_shard(key_t,log_t)
+                instance shard_t : table_shard(key_t,channel_t)
             }
 
             # Describes a key's configuration.
@@ -181,15 +193,19 @@ process client (self:client_id) = {
                 unsub_req_kind, # unsubscribe request
                 unsub_rsp_kind, # unsubscribe response
                 pub_req_kind,   # publish request
-                pub_rsp_kind    # publish response
+                pub_rsp_kind,   # publish response
+                replicate_kind  # server-server log transfer
             }
 
             # Message class for client-server messages.
             class msg_t = {
-                field kind : msg_kind   # kind of message
-                field key : key_t       # key to operate on
-                field val : val_t       # value, if any
-                field log : log_t       # result of a subscribe request
+                field kind : msg_kind           # kind of message
+                field key : key_t               # key to operate on
+                field val : val_t               # value, if any
+                field log : log_t               # result of a subscribe request
+                field src_client : client_id    # requesting client ID
+                field primary : server_id       # who the primary is
+                field shard : shard_t           # shard, only used for replicate messages
             }
 
             # Network for client-server messages.
@@ -330,19 +346,139 @@ process client (self:client_id) = {
             } with client.manager.paxos.nset, manager.paxos.nset.api, manager.paxos.nset.majorities_intersect, client.manager.paxos.round_t, client.manager.paxos.instance_t, vector[client.manager.paxos.vote_t], client.manager.paxos, client.manager.paxos.server, nat
 
             process server(self:server_id) = {
+
                 # Server network sockets.
                 instance sock : net.socket
                 instance man_sock : man_net.socket
 
                 # Server state.
+                instance table : hash_table(key_t,channel_t,shard_t) # K/V replica
+                var view : nat                                          # view version
+                instance confmap : delegation_map(key_t,config)         # configuration
+                instance timer : timeout_sec                            # timer for heartbeat pings
+                instance view_queue : unbounded_queue(man_msg_t)        # holds unprocessed view changes
+                var replicating : bool                                  # is this server replicating new keys now?
 
+                after init {
+                    var conf : config;
+                    conf.primary := 0;
+                    conf.secondary := 1;
+                    conf.replicating := false;
+                    confmap.set(key_t.iter.begin,key_t.iter.end,conf);
+                    view := 0;
+                    replicating := false;
+                }
 
+                # Client-server network.
                 implement sock.recv(src:tcp.endpoint,msg:msg_t) {
-                    
+                    if msg.kind = sub_req_kind | msg.kind = unsub_req_kind {
+                        var conf := confmap.get(msg.key);
+                        var sub := msg.kind = sub_req_kind;
+                        if conf.primary = self {
+                            # Record the subscribe/unsubscribe, then forward to secondary, who will commit and get back to us.
+                            var chan := table.get(msg.key);
+                            #chan.client_subscribed(msg.src_client) := sub;
+                            # Look for this client in subscribed clients.
+                            var clients := chan.clients_subscribed;
+                            var i : index; i := 0;
+                            var found := false;
+                            var found_idx : index;
+                            while i < clients.end {
+                                var c := clients.get(i);
+                                if c = msg.src_client {
+                                    found := true;
+                                    found_idx := i;
+                                }
+                                i := i.next;
+                            }
+                            # Complete the operation, if necessary.
+                            var complete_op := false;
+                            if sub & ~found {
+                                # A new client is subscribing.
+                                chan.clients_subscribed := clients.append(msg.src_client);
+                                complete_op := true;
+                            } else if ~sub & found {
+                                # An existing client is unsubscribing.
+                                var new_clients : client_list;
+                                if found_idx ~= 0 {
+                                    new_clients := new_clients.extend(clients.segment(0,found_idx));
+                                }
+                                if found_idx ~= clients.size() {
+                                    new_clients := new_clients.extend(clients.segment(found_idx+1,clients.size()));
+                                }
+                                chan.clients_subscribed := new_clients;
+                                complete_op := true;
+                            }
+                            if complete_op {
+                                table.set(msg.key,chan);
+                                sock.send(server(conf.secondary).sock.id,msg);
+                            }
+                        } else if conf.secondary = self & ~conf.replicating {
+                            # If we are the secondary and are not replicating, record the subscribe, and respond to the primary.
+                            if src = server(conf.primary).sock.id {
+                                var chan := table.get(msg.key);
+                                #chan.client_subscribed(msg.src_client) := sub;
+                                table.set(msg.key,chan);
+                                msg.kind := sub_rsp_kind;
+                                msg.log := chan.log;
+                                sock.send(server(conf.primary).sock.id,msg);
+                            }
+                        }
+                    } else if msg.kind = sub_rsp_kind | msg.kind = unsub_rsp_kind {
+                        # The secondary has completed the subscribe/unsubscribe, so now it's safe to respond to the client.
+                        sock.send(client(msg.src_client).sock.id,msg);
+                    } else if msg.kind = pub_req_kind {
+                        # TODO
+                    } else if msg.kind = replicate_kind {
+                        # A new primary has sent us their data to replicate it.
+                        var conf := confmap.get(msg.key);
+                        table.incorporate(msg.shard);
+                        conf.secondary := self;
+                        conf.primary := msg.primary;
+                        conf.replicating := false;
+                        confmap.set(msg.shard.lo,msg.shard.hi,conf);
+                        replicating := false;
+                        # Process any view changes we ignored while waiting to replicate.
+                        while ~view_queue.empty & ~replicating {
+                            process_view(view_queue.dequeue);
+                        }
+                    }
+                }
+
+                action process_view(msg:man_msg_t) = {
+                    # Ignore duplicates resulting from multi-Paxos.
+                    if msg.view = view+1 {
+                        var conf := confmap.get(msg.lo.val);
+                        if msg.primary = self & conf.secondary ~= msg.secondary {
+                            # We are the new primary, so the send the new secondary our data.
+                            var rmsg : msg_t;
+                            rmsg.kind := replicate_kind;
+                            rmsg.shard := table.extract_(msg.lo,msg.hi);
+                            rmsg.primary := self;
+                            sock.send(server(msg.secondary).sock.id,rmsg);
+                        }
+                        if self = msg.secondary & self ~= conf.secondary {
+                            # If we are the new secondary, wait for a replicate message.
+                            conf.replicating := true;
+                            replicating := true;
+                        }
+                        # Update our state.
+                        view := msg.view;
+                        conf.primary := msg.primary;
+                        conf.secondary := msg.secondary;
+                        confmap.set(msg.lo,msg.hi,conf);
+                    }
                 }
 
                 implement man_sock.recv(src:tcp.endpoint,msg:man_msg_t) {
-                    
+                    # Management message informing us of view change.
+                    if replicating {
+                        # We're in the middle of another replicate operation, so hold off on this one.
+                        view_queue.enqueue(msg);
+                    } else {
+                        # Otherwise, we can handle the new view.
+                        process_view(msg);
+                    }
                 }
             }
         }
@@ -352,22 +488,49 @@ process client (self:client_id) = {
         #
 
         # Client state.
-        #instance confmap : delegation_map(key_t,config)
+        instance confmap : delegation_map(key_t,config)
 
         # Cliet network sockets.
         instance sock : net.socket
         instance man_sock : man_net.socket
 
+        after init {
+            var conf : config;
+            conf.primary := 0;
+            conf.secondary := 1;
+            conf.replicating := false;
+            confmap.set(key_t.iter.begin,key_t.iter.end,conf);
+        }
+
         implement subscribe_req {
-            
+            var msg : msg_t;
+            msg.kind := sub_req_kind;
+            msg.src_client := self;
+            msg.key := key;
+            var conf := confmap.get(key);
+            var primary := conf.primary;
+            sock.send(server(primary).sock.id,msg);
         }
 
         implement unsubscribe_req {
-
+            var msg : msg_t;
+            msg.kind := unsub_req_kind;
+            msg.src_client := self;
+            msg.key := key;
+            var conf := confmap.get(key);
+            var primary := conf.primary;
+            sock.send(server(primary).sock.id,msg);
         }
 
         implement publish_req {
-
+            var msg : msg_t;
+            msg.kind := pub_req_kind;
+            msg.src_client := self;
+            msg.key := key;
+            msg.val := val;
+            var conf := confmap.get(key);
+            var primary := conf.primary;
+            sock.send(server(primary).sock.id,msg);
         }
 
         implement sock.recv(src:tcp.endpoint,msg:msg_t) {
@@ -381,7 +544,10 @@ process client (self:client_id) = {
         }
 
         implement man_sock.recv(src:tcp.endpoint,msg:man_msg_t) {
-
+            var conf : config;
+            conf.primary := msg.primary;
+            conf.secondary := msg.secondary;
+            confmap.set(msg.lo,msg.hi,conf);
         }
     }
 }
