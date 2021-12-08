@@ -8,6 +8,7 @@ include collections
 include timeout
 
 # Project-specific
+include arrayset
 include shard
 include table
 include delmap
@@ -34,14 +35,13 @@ global {
         field src : client_id
     }
     instance log_t : vector(val_t)  # a history of channel messages
-    instance client_list : vector(client_id)
-    #instance clientset(C:client_id)
+    instance client_set : arrayset(client_id)
 
     # Channel state.
     class channel_t = {
         field log : log_t # channel message history
         #field client_subscribed(C:client_id) : bool # set of clients subscribed to this channel
-        field clients_subscribed : client_list # list of clients subscribed to this channel
+        field clients_subscribed : client_set # set of clients subscribed to this channel
     }
 
     # Specification types.
@@ -93,6 +93,7 @@ process client (self:client_id) = {
 
             after init {
                 pending_subscribe(X,K) := false;
+                pending_unsubscribe(X,K) := false;
                 subscribed(X,K) := false;
                 n_commits(X,K) := 0;
                 n_pubs(X,K) := 0;
@@ -139,8 +140,8 @@ process client (self:client_id) = {
             }
 
             before publish_req(self:client_id,key:key_t,val:val_t) {
-                # Client must be subscribed before it can publish.
-                require subscribed(self,key);
+                # Client must be subscribed and not be unsubscribing to publish.
+                require subscribed(self,key) & ~pending_unsubscribe(self,key);
                 var p := n_pubs(self,key);
                 pending_pub(self,key,p) := true;
                 pending_pub_val(self,key,p) := val;
@@ -377,49 +378,29 @@ process client (self:client_id) = {
                         if conf.primary = self {
                             # Record the subscribe/unsubscribe, then forward to secondary, who will commit and get back to us.
                             var chan := table.get(msg.key);
-                            #chan.client_subscribed(msg.src_client) := sub;
-                            # Look for this client in subscribed clients.
-                            var clients := chan.clients_subscribed;
-                            var i : index; i := 0;
-                            var found := false;
-                            var found_idx : index;
-                            while i < clients.end {
-                                var c := clients.get(i);
-                                if c = msg.src_client {
-                                    found := true;
-                                    found_idx := i;
-                                }
-                                i := i.next;
-                            }
-                            # Complete the operation, if necessary.
-                            var complete_op := false;
-                            if sub & ~found {
+                            if sub {
                                 # A new client is subscribing.
-                                chan.clients_subscribed := clients.append(msg.src_client);
-                                complete_op := true;
-                            } else if ~sub & found {
+                                chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
+                            } else {
                                 # An existing client is unsubscribing.
-                                var new_clients : client_list;
-                                if found_idx ~= 0 {
-                                    new_clients := new_clients.extend(clients.segment(0,found_idx));
-                                }
-                                if found_idx ~= clients.size() {
-                                    new_clients := new_clients.extend(clients.segment(found_idx+1,clients.size()));
-                                }
-                                chan.clients_subscribed := new_clients;
-                                complete_op := true;
+                                chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
                             }
-                            if complete_op {
-                                table.set(msg.key,chan);
-                                sock.send(server(conf.secondary).sock.id,msg);
-                            }
+                            table.set(msg.key,chan);
+                            sock.send(server(conf.secondary).sock.id,msg);
                         } else if conf.secondary = self & ~conf.replicating {
-                            # If we are the secondary and are not replicating, record the subscribe, and respond to the primary.
+                            # If we are the secondary and are not replicating, record the subscribe/unsubscribe, and respond to the primary.
                             if src = server(conf.primary).sock.id {
                                 var chan := table.get(msg.key);
-                                #chan.client_subscribed(msg.src_client) := sub;
+                                if sub {
+                                    # A new client is subscribing.
+                                    chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
+                                    msg.kind := sub_rsp_kind;
+                                } else {
+                                    # An existing client is unsubscribing.
+                                    chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
+                                    msg.kind := unsub_rsp_kind;
+                                }
                                 table.set(msg.key,chan);
-                                msg.kind := sub_rsp_kind;
                                 msg.log := chan.log;
                                 sock.send(server(conf.primary).sock.id,msg);
                             }
@@ -428,7 +409,31 @@ process client (self:client_id) = {
                         # The secondary has completed the subscribe/unsubscribe, so now it's safe to respond to the client.
                         sock.send(client(msg.src_client).sock.id,msg);
                     } else if msg.kind = pub_req_kind {
-                        # TODO
+                        var conf := confmap.get(msg.key);
+                        if conf.primary = self {
+                            var chan := table.get(msg.key);
+                            chan.log := chan.log.append(msg.val);
+                            table.set(msg.key,chan);
+                            sock.send(server(conf.secondary).sock.id,msg);
+                        } else if conf.secondary = self & ~conf.replicating {
+                            if src = server(conf.primary).sock.id {
+                                var chan := table.get(msg.key);
+                                chan.log := chan.log.append(msg.val);
+                                table.set(msg.key,chan);
+                                msg.kind := pub_rsp_kind;
+                                sock.send(server(conf.primary).sock.id,msg);
+                            }
+                        }
+                    } else if msg.kind = pub_rsp_kind {
+                        var conf := confmap.get(msg.key);
+                        var chan := table.get(msg.key);
+                        for it,cl in client_id.iter {
+                            if chan.clients_subscribed.contains(cl) {
+                                sock.send(client(cl).sock.id,msg);
+                            }
+                        }
+                        # TODO Should this be done by the secondary or the primary??
+                        # I'm concerned the client list may be out-of-date
                     } else if msg.kind = replicate_kind {
                         # A new primary has sent us their data to replicate it.
                         var conf := confmap.get(msg.key);
@@ -523,6 +528,7 @@ process client (self:client_id) = {
         }
 
         implement publish_req {
+            val.src := self; # Ivy generates a random value for this, so we need to make sure it matches our ID.
             var msg : msg_t;
             msg.kind := pub_req_kind;
             msg.src_client := self;
