@@ -173,7 +173,7 @@ process client (self:client_id) = {
             action commit(key:key_t,self:client_id,data:data_t) = {
                 var p_lo := n_pubs_committed(self,key);
                 var p_hi:= n_pubs(self,key);
-                debug "commit" with key=key, client=self, data=data, p_lo=p_lo, p_hi=p_hi;
+                debug "commit" with key=key, client=self, data=data;
                 # There must be a pending publish whose value must match this value, 
                 # which has no previous pending publishes, and all further pub_ids are pending.
                 require exists P:pub_id. pending_pub(self,key,P) & pending_pub_data(self,key,P) = data &
@@ -286,6 +286,16 @@ process client (self:client_id) = {
                     if primary ~= secondary {
                         announce(view+1, key_t.iter.create(lokey), key_t.iter.create(hikey), primary, secondary);
                     }
+                }
+
+                # On timer ticks, check if we haven't heard from a server in a while.
+                implement timer.timeout {
+                    for it,sv in server_id.iter {
+                        if ~is_up(sv) {
+                            # TODO
+                        }
+                    }
+                    time := time.next;
                 }
 
                 # Propose a view change to Paxos. The view change will only be broadcast once decided by Paxos.
@@ -517,6 +527,16 @@ process client (self:client_id) = {
                     }
                 }
 
+                # On timer ticks, send a heartbeat message to each manager.
+                implement timer.timeout {
+                    var msg : man_msg_t;
+                    msg.view := view;
+                    msg.src := self;
+                    for it,mn in manager_id.iter {
+                        man_sock.send(manager(mn).sock.id,msg);
+                    }
+                }
+
                 # Ghost code to keep track of publish orders (per key and client)
                 # to check sequential consistency.
                 specification {
@@ -546,15 +566,15 @@ process client (self:client_id) = {
                             }
                         }
 
-                        # After replicating, this ghost action is called to commit any outstanding publishes.
+                        # After replicating, this ghost action is called to dequeue outstanding publishes.
+                        #   Note that these outstanding publishes are not committed here- 
+                        #   they will be committed by the new secondary.
+                        #   This ensures that a publication is only committed once.
                         action commit_all_serialized(k:key_t,self:server_id,secondary:server_id) = {
                             for it,src_client in client_id.iter {
                                 while ~serialized(secondary,k,src_client).empty 
                                 decreases serialized(secondary,k,src_client).tail - serialized(secondary,k,src_client).head {
                                     var data := serialized(secondary,k,src_client).dequeue;
-                                    if self = true_primary(k) {
-                                        commit(k,src_client,data);
-                                    }
                                 }
                                 true_primary(k) := self;
                             }
