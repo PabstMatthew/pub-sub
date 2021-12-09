@@ -14,9 +14,6 @@ include table
 include delmap
 include multi_paxos
 
-# TODO: timeout mechanism, publishes
-include timeout
-
 # Types.
 global {
     # IDs for different processes.
@@ -175,10 +172,11 @@ process client (self:client_id) = {
                 var p_hi:= n_pubs(self,key);
                 debug "commit" with key=key, client=self, data=data;
                 # There must be a pending publish whose value must match this value, 
-                # which has no previous pending publishes, and all further pub_ids are pending.
+                # and all pub_ids after that are pending.
+                # There is no requirement on preceding pub_ids, 
+                # because we're allowing publications the possibility of failure.
                 require exists P:pub_id. pending_pub(self,key,P) & pending_pub_data(self,key,P) = data &
-                                         forall Q:pub_id. (Q < P -> ~pending_pub(self,key,Q)) & 
-                                                          ((Q > P & Q < p_hi) -> pending_pub(self,key,Q));
+                                         forall Q:pub_id. ((Q > P & Q < p_hi) -> pending_pub(self,key,Q));
 
                 pending_pub(self,key,p_lo) := false;
                 pub_committed(self,key,p_lo) := true;
@@ -227,6 +225,7 @@ process client (self:client_id) = {
                 field clients : client_set      # set of subscribed clients to send a message to, 
                                                 # only used to maintain consistency when handling 
                                                 # a publish request
+                field secondary : server_id     # who the secondary is, only used for subscribe requests
             }
 
             # Network for client-server messages.
@@ -289,14 +288,14 @@ process client (self:client_id) = {
                 }
 
                 # On timer ticks, check if we haven't heard from a server in a while.
-                implement timer.timeout {
-                    for it,sv in server_id.iter {
-                        if ~is_up(sv) {
-                            # TODO
-                        }
-                    }
-                    time := time.next;
-                }
+                #implement timer.timeout {
+                #    for it,sv in server_id.iter {
+                #        if ~is_up(sv) {
+                #            # TODO
+                #        }
+                #    }
+                #    time := time.next;
+                #}
 
                 # Propose a view change to Paxos. The view change will only be broadcast once decided by Paxos.
                 action announce(view:nat,lo:key_t.iter.t,hi:key_t.iter.t,primary:server_id,secondary:server_id) = {
@@ -383,12 +382,14 @@ process client (self:client_id) = {
                 instance man_sock : man_net.socket
 
                 # Server state.
-                instance table : hash_table(key_t,channel_t,shard_t) # K/V replica
+                instance table : hash_table(key_t,channel_t,shard_t)    # K/V replica
                 var view : nat                                          # view version
                 instance confmap : delegation_map(key_t,config)         # configuration
                 instance timer : timeout_sec                            # timer for heartbeat pings
                 instance view_queue : unbounded_queue(man_msg_t)        # holds unprocessed view changes
                 var replicating : bool                                  # is this server replicating new keys now?
+                var pending_subs(K:key_t) : client_set                  # subscriptions that a secondary is waiting to hear an ACK for
+                var last_pub(K:key_t) : index                           # the number of publications completed (and clients notified) for a given key
 
                 after init {
                     var conf : config;
@@ -402,41 +403,109 @@ process client (self:client_id) = {
 
                 # Client-server network.
                 implement sock.recv(src:tcp.endpoint,msg:msg_t) {
-                    if msg.kind = sub_req_kind | msg.kind = unsub_req_kind {
+                    if msg.kind = sub_req_kind {
+                        # The interaction between subscribes and publishes is extremely tricky. 
+                        # I need to ensure that no pub_rsp are sent to clients before sub_rsp, 
+                        # but also that no messages are lost in this process, and that all clients 
+                        # see the same order of messages in each channel.
+
+                        # To avoid any races, I use the following protocol:
+                        # 1. The primary first sends the request to the secondary
+                        # 2. The intended secondary records the request, but does not persistently complete it, 
+                        #    and sends a response to the whomever it thinks is the primary (may not be the original primary).
+                        # 3. If the recipient of that message is not the primary, it sends it to whomever it thinks the new primary is, repeating the process.
+                        #    If the recipient of that message is the primary and the secondary has changed, the request is restarted.
+                        #    If the recipient of that message is the primary and the secondary hasn't changed, it updates it state, and notifies the client and the secondary.
+
+                        # Here's a quick argument that this strategy works by looking at the tricky cases:
+                        # - If the primary gets reassigned before the secondary responds, the following cases could occur:
+                        #   - the secondary receives the message before it is promoted to primary, and notifies the primary, who will restart the request.
+                        #   - the secondary changes to primary, then to something else before the message arrives, meaning it will restart the request.
+                        #   - the secondary changes to primary, receives the request, then restarts the request.
+                        # - If the secondary gets reassigned before a response from the original secondary, 
+                        #   the primary will notice, and restart the request.
+                        # Basically, if the primary and secondary are not reassigned for 3 message exchanges, the request will succeed,
+                        # and otherwise, it will be restarted.
+                        
+                        # While this process is happening, publishes to this channel may occur, and as a result,
+                        # each sub_rsp may need these intervening messages added. This is accomplished by simply 
+                        # tracking the number of completed publishes and copying any extras to subscribe responses.
+
                         var conf := confmap.get(msg.key);
-                        var sub := msg.kind = sub_req_kind;
                         if conf.primary = self {
-                            # Record the subscribe/unsubscribe, then forward to secondary, who will commit and get back to us.
-                            var chan := table.get(msg.key);
-                            if sub {
-                                # A new client is subscribing.
-                                chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
-                            } else {
-                                # An existing client is unsubscribing.
-                                chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
-                            }
-                            table.set(msg.key,chan);
+                            # Notify the secondary, and wait for a response.
+                            msg.secondary := conf.secondary;
                             sock.send(server(conf.secondary).sock.id,msg);
                         } else if conf.secondary = self & ~conf.replicating {
-                            # If we are the secondary and are not replicating, record the subscribe/unsubscribe, and respond to the primary.
-                            if src = server(conf.primary).sock.id {
-                                var chan := table.get(msg.key);
-                                if sub {
-                                    # A new client is subscribing.
-                                    chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
-                                    msg.kind := sub_rsp_kind;
-                                } else {
-                                    # An existing client is unsubscribing.
-                                    chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
-                                    msg.kind := unsub_rsp_kind;
-                                }
-                                table.set(msg.key,chan);
-                                msg.log := chan.log;
-                                sock.send(server(conf.primary).sock.id,msg);
-                            }
+                            # If we are the secondary and are not replicating, record the subscribe, and respond to the primary.
+                            pending_subs(msg.key) := pending_subs(msg.key).add(msg.src_client);
+                            msg.kind := sub_rsp_kind;
+                            var chan := table.get(msg.key);
+                            msg.log := chan.log;
+                            sock.send(server(conf.primary).sock.id,msg);
                         }
-                    } else if msg.kind = sub_rsp_kind | msg.kind = unsub_rsp_kind {
-                        # The secondary has completed the subscribe/unsubscribe, so now it's safe to respond to the client.
+                    } else if msg.kind = sub_rsp_kind {
+                        var conf := confmap.get(msg.key);
+                        if conf.primary = self {
+                            # If I'm still the primary, we're good to proceed.
+                            if conf.secondary ~= msg.secondary {
+                                # The secondary was reassigned, so let's retry the operation.
+                                msg.secondary := conf.secondary;
+                                msg.kind := sub_req_kind;
+                                sock.send(server(conf.secondary).sock.id,msg);
+                            } else {
+                                # The secondary has received the subscribe, so now it's safe to update our state and respond to the client.
+                                var chan := table.get(msg.key);
+                                chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
+                                table.set(msg.key,chan);
+                                # Catch the client up on any new messages.
+                                var idx : index; idx := 0;
+                                var log_size := msg.log.size();
+                                while idx < last_pub(msg.key) {
+                                    if idx >= log_size {
+                                        msg.log := msg.log.append(chan.log.get(idx));
+                                    }
+                                    idx := idx.next;
+                                }
+                                sock.send(client(msg.src_client).sock.id,msg);
+                                # Notify the secondary of success.
+                                sock.send(server(msg.secondary).sock.id,msg);
+                            }
+                        } else if msg.secondary = self { 
+                            # Note that we are msg.secondary, and not necessarily conf.secondary.
+                            # This is an important distinction because multiple servers may think they are conf.secondary 
+                            # for a particular key, which could cause duplicate subscribe responses. Only the intended secondary 
+                            # recipient should respond to avoid this problem.
+
+                            # The primary ACK'd this subscribe, so we're safe to complete it.
+                            var chan := table.get(msg.key);
+                            pending_subs(msg.key) := pending_subs(msg.key).remove(msg.src_client);
+                            chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
+                            table.set(msg.key,chan);
+                        } else {
+                            # I'm no longer the primary, so I need to tell the new primary to retry.
+                            msg.kind := sub_req_kind;
+                            sock.send(server(conf.primary).sock.id,msg);
+                        }
+                    } else if msg.kind = unsub_req_kind {
+                        # Here is the plan: we remove this client from our set to be conservative, 
+                        # alert the secondary, but wait for secondary to complete before responding.
+                        var conf := confmap.get(msg.key);
+                        if conf.primary = self {
+                            var chan := table.get(msg.key);
+                            chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
+                            table.set(msg.key,chan);
+                            msg.secondary := conf.secondary;
+                            sock.send(server(conf.secondary).sock.id,msg);
+                        } else if msg.secondary = self {
+                            var chan := table.get(msg.key);
+                            chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
+                            table.set(msg.key,chan);
+                            msg.kind := unsub_rsp_kind;
+                            sock.send(server(conf.primary).sock.id,msg);
+                        }
+                    } else if msg.kind = unsub_rsp_kind {
+                        # Forward to the client.
                         sock.send(client(msg.src_client).sock.id,msg);
                     } else if msg.kind = pub_req_kind {
                         var conf := confmap.get(msg.key);
@@ -452,6 +521,7 @@ process client (self:client_id) = {
                                 var chan := table.get(msg.key);
                                 chan.log := chan.log.append(msg.val);
                                 table.set(msg.key,chan);
+                                msg.log := chan.log; # only used for tracking purposes, not actually used by clients.
                                 msg.kind := pub_rsp_kind;
                                 msg.clients := chan.clients_subscribed;
                                 sock.send(server(conf.primary).sock.id,msg);
@@ -462,11 +532,14 @@ process client (self:client_id) = {
                     } else if msg.kind = pub_rsp_kind {
                         # Broadcast the publish to all subscribed clients, 
                         # as determined by the secondary.
+                        var chan := table.get(msg.key);
                         for it,cl in client_id.iter {
-                            if msg.clients.contains(cl) {
+                            if chan.clients_subscribed.contains(cl) {
                                 sock.send(client(cl).sock.id,msg);
                             }
                         }
+                        # Update state.
+                        last_pub(msg.key) := msg.log.size();
                     } else if msg.kind = replicate_kind {
                         # A new primary has sent us their data to replicate it.
                         var conf := confmap.get(msg.key);
@@ -487,9 +560,13 @@ process client (self:client_id) = {
                     # Ignore duplicates resulting from multi-Paxos.
                     if msg.view = view+1 {
                         var conf := confmap.get(msg.lo.val);
+                        if conf.secondary = self & msg.secondary ~= self {
+                            # We used to be the secondary, so clear our state.
+                            pending_subs(K) := client_set.emptyset;
+                        }
                         if msg.primary = self & conf.secondary ~= msg.secondary {
                             # We are the new primary, so the send the new secondary our data.
-                            debug "becoming primary" with server=self;
+                            debug "becoming primary" with server=self, lo=msg.lo.val, hi=msg.hi.val;
                             var rmsg : msg_t;
                             rmsg.kind := replicate_kind;
                             rmsg.shard := table.extract_(msg.lo,msg.hi);
@@ -504,7 +581,7 @@ process client (self:client_id) = {
                         }
                         if self = msg.secondary & self ~= conf.secondary {
                             # If we are the new secondary, wait for a replicate message.
-                            debug "becoming secondary" with server=self;
+                            debug "becoming secondary" with server=self, lo=msg.lo.val, hi=msg.hi.val;
                             conf.replicating := true;
                             replicating := true;
                         }
@@ -528,14 +605,14 @@ process client (self:client_id) = {
                 }
 
                 # On timer ticks, send a heartbeat message to each manager.
-                implement timer.timeout {
-                    var msg : man_msg_t;
-                    msg.view := view;
-                    msg.src := self;
-                    for it,mn in manager_id.iter {
-                        man_sock.send(manager(mn).sock.id,msg);
-                    }
-                }
+                #implement timer.timeout {
+                #    var msg : man_msg_t;
+                #    msg.view := view;
+                #    msg.src := self;
+                #    for it,mn in manager_id.iter {
+                #        man_sock.send(manager(mn).sock.id,msg);
+                #    }
+                #}
 
                 # Ghost code to keep track of publish orders (per key and client)
                 # to check sequential consistency.
@@ -617,13 +694,13 @@ process client (self:client_id) = {
         }
 
         implement unsubscribe_req {
-            var msg : msg_t;
-            msg.kind := unsub_req_kind;
-            msg.src_client := self;
-            msg.key := key;
-            var conf := confmap.get(key);
-            var primary := conf.primary;
-            sock.send(server(primary).sock.id,msg);
+            #var msg : msg_t;
+            #msg.kind := unsub_req_kind;
+            #msg.src_client := self;
+            #msg.key := key;
+            #var conf := confmap.get(key);
+            #var primary := conf.primary;
+            #sock.send(server(primary).sock.id,msg);
         }
 
         implement publish_req {
