@@ -575,9 +575,12 @@ process client (self:client_id) = {
                                 while ~serialized(secondary,k,src_client).empty 
                                 decreases serialized(secondary,k,src_client).tail - serialized(secondary,k,src_client).head {
                                     var data := serialized(secondary,k,src_client).dequeue;
+                                    if self = true_primary(k) {
+                                        commit(k,src_client,data);
+                                    }
                                 }
-                                true_primary(k) := self;
                             }
+                            true_primary(k) := self;
                         }
                     }
                 }
