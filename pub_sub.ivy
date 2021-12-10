@@ -5,7 +5,6 @@ include numbers
 include network
 include order
 include collections
-include timeout
 
 # Project-specific
 include arrayset
@@ -230,14 +229,10 @@ process client (self:client_id) = {
 
                 # Manager state.
                 var view : nat                  # the current view number
-                var time : nat                  # the current time (in seconds)
-                var heard(S:server_id) : nat    # last time we heard from server S
                 var proposed : bool             # have we proposed a new view?
                 instance confmap : delegation_map(key_t,config)    # stores configuration for each key
 
                 common {
-                    # Server failure timeout, can be overridden on command line.
-                    parameter fail_time : nat = 2
                     # Paxos decides on this operation, but can optionally decide nothing.
                     instance op_t : option(man_msg_t)
                 }
@@ -245,12 +240,8 @@ process client (self:client_id) = {
                 # Manager's socket on management network.
                 instance sock : man_net.socket
 
-                # A timer that ticks once a second.
-                instance timer : timeout_sec
-
                 after init {
                     view := 0;
-                    time := 0;
                     proposed := false;
                     var conf : config;
                     conf.primary := 0;
@@ -259,25 +250,12 @@ process client (self:client_id) = {
                     confmap.set(key_t.iter.begin,key_t.iter.end,conf);
                 }
 
-                # A server is up if we've heard from it in the last `fail_time` seconds.
-                function is_up(S:server_id) = time <= heard(S) + fail_time
-
                 # Managers take commands to assign a range of keys `[lo,hi)` to a given primary and secondary.
                 export action assign(lokey:key_t,hikey:key_t,primary:server_id,secondary:server_id) = {
                     if primary ~= secondary {
                         announce(view+1, key_t.iter.create(lokey), key_t.iter.create(hikey), primary, secondary);
                     }
                 }
-
-                # On timer ticks, check if we haven't heard from a server in a while.
-                #implement timer.timeout {
-                #    for it,sv in server_id.iter {
-                #        if ~is_up(sv) {
-                #            # TODO
-                #        }
-                #    }
-                #    time := time.next;
-                #}
 
                 # Propose a view change to Paxos. The view change will only be broadcast once decided by Paxos.
                 action announce(view:nat,lo:key_t.iter.t,hi:key_t.iter.t,primary:server_id,secondary:server_id) = {
@@ -345,13 +323,6 @@ process client (self:client_id) = {
                     }
                 }
 
-                # Record time from server ping messages.
-                implement sock.recv(src:tcp.endpoint,msg:man_msg_t) {
-                    if msg.view = view {
-                        heard(msg.src) := time;
-                    }
-                }
-
                 # Paxos instantation.
                 instance paxos : multi_paxos(manager_id,client.manager.op_t,client.manager.op_t.empty)
 
@@ -367,7 +338,6 @@ process client (self:client_id) = {
                 instance table : hash_table(key_t,channel_t,shard_t)    # K/V replica
                 var view : nat                                          # view version
                 instance confmap : delegation_map(key_t,config)         # configuration
-                instance timer : timeout_sec                            # timer for heartbeat pings
                 instance view_queue : unbounded_queue(man_msg_t)        # holds unprocessed view changes
                 var replicating : bool                                  # is this server replicating new keys now?
                 var last_pub(K:key_t) : index                           # the number of publications completed (and clients notified) for a given key
@@ -620,16 +590,6 @@ process client (self:client_id) = {
                         process_view(msg);
                     }
                 }
-
-                # On timer ticks, send a heartbeat message to each manager.
-                #implement timer.timeout {
-                #    var msg : man_msg_t;
-                #    msg.view := view;
-                #    msg.src := self;
-                #    for it,mn in manager_id.iter {
-                #        man_sock.send(manager(mn).sock.id,msg);
-                #    }
-                #}
 
                 # Ghost code to keep track of publish orders (per key and client)
                 # to check sequential consistency.
