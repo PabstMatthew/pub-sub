@@ -489,14 +489,12 @@ process client (self:client_id) = {
                         # Forward the response to the client.
                         sock.send(client(msg.src_client).sock.id,msg);
                     } else if msg.kind = pub_req_kind {
-                        # Here's a race condition:
-                        # The primary accepts a publication request, and forwards to secondary.
-                        # Before the request arrives at the secondary, the secondary gets promoted and starts handling new pubs.
-                        # Now, when the request arrives at the new primary, it may be committed after newer requests. 
-                        # Solution: primary will only handle pub reqs if their client_idx is greater than the max for this client.
                         var conf := confmap.get(msg.key);
                         var chan := table.get(msg.key);
-                        if conf.primary = self {
+                        if conf.primary = self & msg.secondary ~= self {
+                            # We cannot process a request if we were supposed to be a secondary,
+                            # because otherwise, the original primary may commit the publication while we
+                            # unknowingly ressurect it.
                             # Only allow publications if we've dealt with all pending subscriptions from previous views.
                             if chan.pending_subs.size = 0 {
                                 # Prevent zombie requests from earlier views from breaking sequential consistency.
@@ -509,6 +507,7 @@ process client (self:client_id) = {
                                     }
                                     chan.log := chan.log.append(msg.val);
                                     table.set(msg.key,chan);
+                                    msg.secondary := conf.secondary;
                                     sock.send(server(conf.secondary).sock.id,msg);
                                     # Receiving this request has serialized its order.
                                     serialize(msg.key,self,conf.secondary,msg.src_client,msg.val);
