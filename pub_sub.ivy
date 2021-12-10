@@ -433,11 +433,18 @@ process client (self:client_id) = {
 
                         var conf := confmap.get(msg.key);
                         if conf.primary = self {
+                            debug "primary notifying secondary" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                             # Notify the secondary, and wait for a response.
                             msg.secondary := conf.secondary;
                             sock.send(server(conf.secondary).sock.id,msg);
-                        } else if conf.secondary = self & ~conf.replicating {
-                            # If we are the secondary and are not replicating, record the subscribe, and respond to the primary.
+                        } else if msg.secondary = self {
+                            # Note that we are msg.secondary, and not necessarily conf.secondary.
+                            # This is an important distinction because multiple servers may think they are conf.secondary 
+                            # for a particular key, which could cause duplicate subscribe responses. Only the intended secondary 
+                            # recipient should respond to avoid this problem.
+
+                            debug "msg.secondary notifying primary" with primary=conf.primary, conf_secondary=conf.secondary, msg_secondary=self, key=msg.key, client=msg.src_client;
+                            # Record the subscribe, and respond to the primary.
                             pending_subs(msg.key) := pending_subs(msg.key).add(msg.src_client);
                             msg.kind := sub_rsp_kind;
                             var chan := table.get(msg.key);
@@ -449,11 +456,13 @@ process client (self:client_id) = {
                         if conf.primary = self {
                             # If I'm still the primary, we're good to proceed.
                             if conf.secondary ~= msg.secondary {
+                                debug "still primary, retrying" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                                 # The secondary was reassigned, so let's retry the operation.
                                 msg.secondary := conf.secondary;
                                 msg.kind := sub_req_kind;
                                 sock.send(server(conf.secondary).sock.id,msg);
                             } else {
+                                debug "still primary, completing" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                                 # The secondary has received the subscribe, so now it's safe to update our state and respond to the client.
                                 var chan := table.get(msg.key);
                                 chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
@@ -469,20 +478,17 @@ process client (self:client_id) = {
                                 }
                                 sock.send(client(msg.src_client).sock.id,msg);
                                 # Notify the secondary of success.
-                                sock.send(server(msg.secondary).sock.id,msg);
+                                sock.send(server(conf.secondary).sock.id,msg);
                             }
-                        } else if msg.secondary = self { 
-                            # Note that we are msg.secondary, and not necessarily conf.secondary.
-                            # This is an important distinction because multiple servers may think they are conf.secondary 
-                            # for a particular key, which could cause duplicate subscribe responses. Only the intended secondary 
-                            # recipient should respond to avoid this problem.
-
+                        } else if conf.secondary = self { 
+                            debug "secondary recv'd ACK, completing" with primary=conf.primary, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                             # The primary ACK'd this subscribe, so we're safe to complete it.
                             var chan := table.get(msg.key);
                             pending_subs(msg.key) := pending_subs(msg.key).remove(msg.src_client);
                             chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
                             table.set(msg.key,chan);
                         } else {
+                            debug "got reassigned, notifying primary to retry" with primary=conf.primary, key=msg.key, client=msg.src_client;
                             # I'm no longer the primary, so I need to tell the new primary to retry.
                             msg.kind := sub_req_kind;
                             sock.send(server(conf.primary).sock.id,msg);
