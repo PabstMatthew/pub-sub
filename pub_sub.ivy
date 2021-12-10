@@ -82,13 +82,13 @@ process client (self:client_id) = {
             var pending_pub_data(X:client_id,K:key_t,P:pub_id) : data_t # all the pending values published by each client to each key
 
             # Checks if a commit is consistent with our requirements.
-            function valid_commit(K:key_t,P:pub_id,V:val_t) =
+            function valid_commit(k:key_t,c:pub_id,v:val_t) =
                                 # The commit must agree with other clients' orders for this key.
                                 # Basically, everyone agrees on *some* order for the channel.
-                                (forall X:client_id. n_commits(X,K) > P -> commit_order(X,K,P) = V) &
+                                (forall X:client_id. n_commits(X,k) > c -> commit_order(X,k,c) = v) &
                                 # The commit must have come from somewhere.
-                                (exists X:client_id,P:pub_id. (n_commits(X,K) > P & V.src = X) | 
-                                                              ((pending_pub(X,K,P) | pub_committed(X,K,P)) & pending_pub_data(X,K,P) = V.data))
+                                (exists P:pub_id. (pending_pub(v.src,k,P) | pub_committed(v.src,k,P)) & 
+                                                   pending_pub_data(v.src,k,P) = v.data)
 
             after init {
                 pending_subscribe(X,K) := false;
@@ -434,7 +434,7 @@ process client (self:client_id) = {
 
                         var conf := confmap.get(msg.key);
                         if conf.primary = self {
-                            debug "primary notifying secondary" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
+                            #debug "primary notifying secondary" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                             # Notify the secondary, and wait for a response.
                             msg.secondary := conf.secondary;
                             sock.send(server(conf.secondary).sock.id,msg);
@@ -444,7 +444,7 @@ process client (self:client_id) = {
                             # for a particular key, which could cause duplicate subscribe responses. Only the intended secondary 
                             # recipient should respond to avoid this problem.
 
-                            debug "msg.secondary notifying primary" with primary=conf.primary, conf_secondary=conf.secondary, msg_secondary=self, key=msg.key, client=msg.src_client;
+                            #debug "msg.secondary notifying primary" with primary=conf.primary, conf_secondary=conf.secondary, msg_secondary=self, key=msg.key, client=msg.src_client;
                             # Record the subscribe, and respond to the primary.
                             msg.kind := sub_rsp_kind;
                             var chan := table.get(msg.key);
@@ -460,12 +460,12 @@ process client (self:client_id) = {
                             # So, we need to retry the operation.
                             # If the new secondary receives this as the new secondary, it will complete it normally.
                             # Else, the new secondary receives this as the new primary and will retry.
-                            debug "still primary, retrying" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
+                            #debug "still primary, retrying" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                             msg.secondary := conf.secondary;
                             msg.kind := sub_req_kind;
                             sock.send(server(conf.secondary).sock.id,msg);
                         } else if conf.primary = self {
-                            debug "primary received response from secondary, completing" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
+                            #debug "primary received response from secondary, completing" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                             # Either I am the original primary, and the secondary received the subscribe, so we're safe to complete, or
                             # I'm the promoted secondary, and the new secondary has inherited my pending_subs, so we're safe to complete.
                             var chan := table.get(msg.key);
@@ -487,7 +487,7 @@ process client (self:client_id) = {
                             sock.send(server(conf.secondary).sock.id,msg);
                         } else if msg.secondary = self { 
                             # This message was sent by a primary to notify us of a completed subscribe.
-                            debug "secondary recv'd ACK" with self=self, primary=conf.primary, secondary=conf.secondary, key=msg.key, client=msg.src_client;
+                            #debug "secondary recv'd ACK" with self=self, primary=conf.primary, secondary=conf.secondary, key=msg.key, client=msg.src_client;
                             if conf.secondary = self {
                                 # The primary ACK'd this subscribe, so we're safe to complete it.
                                 var chan := table.get(msg.key);
@@ -501,7 +501,7 @@ process client (self:client_id) = {
                                 # the subscription from the primary, and we're all clear to drop this ACK.
                             }
                         } else {
-                            debug "got reassigned, notifying primary to retry" with primary=conf.primary, key=msg.key, client=msg.src_client;
+                            #debug "got reassigned, notifying primary to retry" with primary=conf.primary, key=msg.key, client=msg.src_client;
                             # I'm no longer the primary, so I need to tell the new primary to retry.
                             msg.kind := sub_req_kind;
                             sock.send(server(conf.primary).sock.id,msg);
