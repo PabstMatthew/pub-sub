@@ -137,8 +137,7 @@ process client (self:client_id) = {
 
             before publish_req(self:client_id,key:key_t,data:data_t) {
                 # Client must be subscribed and not be unsubscribing to publish.
-                #require subscribed(self,key) & ~pending_unsubscribe(self,key);
-                require subscribed(self,key);
+                require subscribed(self,key) & ~pending_unsubscribe(self,key);
             }
 
             before publish_rsp(self:client_id,key:key_t,val:val_t) {
@@ -459,24 +458,35 @@ process client (self:client_id) = {
                             sock.send(server(conf.primary).sock.id,msg);
                         }
                     } else if msg.kind = unsub_req_kind {
-                        # Here is the plan: we remove this client from our set to be conservative, 
-                        # alert the secondary, but wait for secondary to complete before responding.
                         var conf := confmap.get(msg.key);
                         if conf.primary = self {
+                            # Here is the plan: we remove this client from our set to be conservative, 
+                            # alert the secondary, but wait for secondary to complete before responding.
                             var chan := table.get(msg.key);
                             chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
                             table.set(msg.key,chan);
                             msg.secondary := conf.secondary;
                             sock.send(server(conf.secondary).sock.id,msg);
                         } else if msg.secondary = self {
-                            var chan := table.get(msg.key);
-                            chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
-                            table.set(msg.key,chan);
-                            msg.kind := unsub_rsp_kind;
-                            sock.send(server(conf.primary).sock.id,msg);
+                            if conf.secondary ~= self {
+                                # I've been re-assigned, so I need to make sure the request survives.
+                                sock.send(server(conf.primary).sock.id,msg);
+                            } else {
+                                # I think I'm still the secondary, so I should complete the request, and notify the client.
+                                # Here's a quick justification:
+                                #   If I become primary, I won't send publishes to this client.
+                                #   If some other server becomes the secondary, it should have replicated the primary's subscriber list.
+                                var chan := table.get(msg.key);
+                                chan.clients_subscribed := chan.clients_subscribed.remove(msg.src_client);
+                                table.set(msg.key,chan);
+                                msg.kind := unsub_rsp_kind;
+                                # Send response to the primary, which ensures that the client response 
+                                # happens after all in-flight publishes complete.
+                                sock.send(server(conf.primary).sock.id,msg);
+                            }
                         }
                     } else if msg.kind = unsub_rsp_kind {
-                        # Forward to the client.
+                        # Forward the response to the client.
                         sock.send(client(msg.src_client).sock.id,msg);
                     } else if msg.kind = pub_req_kind {
                         # Here's a race condition:
@@ -672,13 +682,13 @@ process client (self:client_id) = {
         }
 
         implement unsubscribe_req {
-            #var msg : msg_t;
-            #msg.kind := unsub_req_kind;
-            #msg.src_client := self;
-            #msg.key := key;
-            #var conf := confmap.get(key);
-            #var primary := conf.primary;
-            #sock.send(server(primary).sock.id,msg);
+            var msg : msg_t;
+            msg.kind := unsub_req_kind;
+            msg.src_client := self;
+            msg.key := key;
+            var conf := confmap.get(key);
+            var primary := conf.primary;
+            sock.send(server(primary).sock.id,msg);
         }
 
         implement publish_req {
