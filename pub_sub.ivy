@@ -21,6 +21,9 @@ global {
     instance server_id : iterable
     instance manager_id : iterable
 
+    # IDs that order publications.
+    instance pub_id : iterable
+
     # Key type used to identify pub/sub channels.
     instance key_t : iterable
 
@@ -28,8 +31,11 @@ global {
     alias byte = uint[8]
     alias data_t = byte
     class val_t = {
-        field data : data_t
-        field src : client_id
+        field data : data_t         # the actual publication request data
+        field src : client_id       # which client requested this publication
+        field idx : pub_id          # the total order index of this message in the channel
+        field client_idx : pub_id   # the order of this message among this client's publications
+                                    # (only used in ghost code)
     }
     instance log_t : vector(val_t)  # a history of channel messages
     instance client_set : arrayset(client_id)
@@ -40,9 +46,6 @@ global {
         field clients_subscribed : client_set   # set of clients subscribed to this channel
         field pending_subs : client_set         # set of pending subscriptions
     }
-
-    # Specification types.
-    instance pub_id : iterable
 }
 
 process client (self:client_id) = {
@@ -73,30 +76,25 @@ process client (self:client_id) = {
             var pending_subscribe(X:client_id,K:key_t) : bool           # a subscribe is pending for this key
             var pending_unsubscribe(X:client_id,K:key_t) : bool         # an unsubscribe is pending for this key
             var subscribed(X:client_id,K:key_t) : bool                  # this client is subscribed to this key
-            var n_commits(X:client_id,K:key_t) : pub_id                 # the total number of publications seen by this client
+            var committed(X:client_id,K:key_t,C:pub_id) : bool          # has this client received a publication for this index?
             var commit_order(X:client_id,K:key_t,C:pub_id) : val_t      # the total publication order seen by each client to each key
-            var n_pubs(X:client_id,K:key_t) : pub_id                    # the number of publications requested by this client
-            var n_pubs_committed(X:client_id,K:key_t) : pub_id          # the number of publications "committed" that were requested by this client
-            var pending_pub(X:client_id,K:key_t,P:pub_id) : bool        # does a client have a pending publication for this?
-            var pub_committed(X:client_id,K:key_t,P:pub_id) : bool      # has this client's publication been committed yet?
-            var pending_pub_data(X:client_id,K:key_t,P:pub_id) : data_t # all the pending values published by each client to each key
+            var pub_committed(X:client_id,K:key_t,C:pub_id) : bool      # has this publication been committed?
+            var pub_rsps(X:client_id,K:key_t,C:pub_id) : val_t          # the publication commit order for this client
 
             # Checks if a commit is consistent with our requirements.
-            function valid_commit(k:key_t,c:pub_id,v:val_t) =
-                                # The commit must agree with other clients' orders for this key.
+            function valid_commit(k:key_t,v:val_t) =
+                                # The commit must agree with other clients' index for this key.
                                 # Basically, everyone agrees on *some* order for the channel.
-                                (forall X:client_id. n_commits(X,k) > c -> commit_order(X,k,c) = v) &
+                                (forall X:client_id. committed(X,k,v.idx) -> commit_order(X,k,v.idx) = v) &
                                 # The commit must have come from somewhere.
-                                (exists P:pub_id. (pending_pub(v.src,k,P) | pub_committed(v.src,k,P)) & 
-                                                   pending_pub_data(v.src,k,P) = v.data)
+                                (exists P:pub_id. (pub_committed(v.src,k,P) & pub_rsps(v.src,k,P) = v))
 
             after init {
                 pending_subscribe(X,K) := false;
                 pending_unsubscribe(X,K) := false;
                 subscribed(X,K) := false;
-                n_commits(X,K) := 0;
-                n_pubs(X,K) := 0;
-                n_pubs_committed(X,K) := 0;
+                committed(X,K,C) := false;
+                pub_committed(X,K,C) := false;
             }
 
             before subscribe_req(self:client_id,key:key_t) {
@@ -114,15 +112,14 @@ process client (self:client_id) = {
                 # Add all entries to this client's observed commit order, 
                 # and check that they match other clients'.
                 var i : index; i := 0;
-                var c : pub_id; c := 0;
                 while i < content.end
                 decreases content.end - i {
                     var val := content.get(i);
-                    require valid_commit(key,c,val);
-                    commit_order(self,key,c) := val;
-                    i := i.next; c := c.next;
+                    require valid_commit(key,val);
+                    commit_order(self,key,val.idx) := val;
+                    committed(self,key,val.idx) := true;
+                    i := i.next;
                 }
-                n_commits(self,key) := c;
             }
 
             before unsubscribe_req(self:client_id,key:key_t) {
@@ -143,45 +140,29 @@ process client (self:client_id) = {
                 # Client must be subscribed and not be unsubscribing to publish.
                 #require subscribed(self,key) & ~pending_unsubscribe(self,key);
                 require subscribed(self,key);
-                var p := n_pubs(self,key);
-                pending_pub(self,key,p) := true;
-                var val : val_t;
-                val.data := data;
-                val.src := self;
-                pending_pub_data(self,key,p) := data;
-                n_pubs(self,key) := p.next;
             }
 
             before publish_rsp(self:client_id,key:key_t,val:val_t) {
                 # Client must still be subscribed to this key.
                 require subscribed(self,key);
                 # Keep track of this publication, and make sure it matches other clients.
-                var c := n_commits(self,key);
-                # Consistency check for self-publications done in `commit`, 
-                # so this check is only for other clients' commits.
-                if val.src ~= self {
-                    require valid_commit(key,c,val);
-                }
-                commit_order(self,key,c) := val;
-                n_commits(self,key) := c.next;
+                require valid_commit(key,val);
+                commit_order(self,key,val.idx) := val;
+                committed(self,key,val.idx) := true;
             }
 
             # Called when a client's publish has been "committed" server-side.
             # Here, I check that the publication is sequentially consistent.
-            action commit(key:key_t,self:client_id,data:data_t) = {
-                var p_lo := n_pubs_committed(self,key);
-                var p_hi:= n_pubs(self,key);
-                debug "commit" with key=key, client=self, data=data;
-                # There must be a pending publish whose value must match this value, 
-                # and all pub_ids after that are pending.
-                # There is no requirement on preceding pub_ids, 
-                # because we're allowing publications the possibility of failure.
-                require exists P:pub_id. pending_pub(self,key,P) & pending_pub_data(self,key,P) = data &
-                                         forall Q:pub_id. ((Q > P & Q < p_hi) -> pending_pub(self,key,Q));
-
-                pending_pub(self,key,p_lo) := false;
-                pub_committed(self,key,p_lo) := true;
-                n_pubs_committed(self,key) := p_lo.next;
+            action commit(key:key_t,self:client_id,val:val_t) = {
+                debug "commit" with key=key, client=self, val=val;
+                # Sanity check that we only commit publictaions once.
+                require ~pub_committed(self,key,val.client_idx);
+                # If one of our publications is committed, we need to check that 
+                # its total order obeys our private order (i.e. sequential consistency).
+                require forall P:pub_id. ((P > val.client_idx & pub_committed(self,key,P)) -> (pub_rsps(self,key,P).idx > val.idx)) &
+                                         ((P < val.client_idx & pub_committed(self,key,P)) -> (pub_rsps(self,key,P).idx < val.idx));
+                pub_committed(self,key,val.client_idx) := true;
+                pub_rsps(self,key,val.client_idx) := val;
             }
 
         }
@@ -390,6 +371,7 @@ process client (self:client_id) = {
                 instance view_queue : unbounded_queue(man_msg_t)        # holds unprocessed view changes
                 var replicating : bool                                  # is this server replicating new keys now?
                 var last_pub(K:key_t) : index                           # the number of publications completed (and clients notified) for a given key
+                var max_client_idx(K:key_t) : pub_id                    # the largest client_idx we've seen for this key
 
                 after init {
                     var conf : config;
@@ -455,50 +437,50 @@ process client (self:client_id) = {
                         }
                     } else if msg.kind = sub_rsp_kind {
                         var conf := confmap.get(msg.key);
-                        if conf.primary = self & msg.secondary ~= self & conf.secondary ~= msg.secondary {
-                            # I was the original primary, I still think I'm the primary, and the secondary has changed.
-                            # So, we need to retry the operation.
-                            # If the new secondary receives this as the new secondary, it will complete it normally.
-                            # Else, the new secondary receives this as the new primary and will retry.
-                            #debug "still primary, retrying" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
-                            msg.secondary := conf.secondary;
-                            msg.kind := sub_req_kind;
-                            sock.send(server(conf.secondary).sock.id,msg);
-                        } else if conf.primary = self {
-                            #debug "primary received response from secondary, completing" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
-                            # Either I am the original primary, and the secondary received the subscribe, so we're safe to complete, or
-                            # I'm the promoted secondary, and the new secondary has inherited my pending_subs, so we're safe to complete.
-                            var chan := table.get(msg.key);
-                            chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
-                            chan.pending_subs := chan.pending_subs.remove(msg.src_client);
-                            table.set(msg.key,chan);
-                            # Catch the client up on any new messages.
-                            var idx : index; idx := 0;
-                            var log_size := msg.log.size();
-                            while idx < last_pub(msg.key) {
-                                if idx >= log_size {
-                                    msg.log := msg.log.append(chan.log.get(idx));
-                                }
-                                idx := idx.next;
-                            }
-                            sock.send(client(msg.src_client).sock.id,msg);
-                            # Notify the secondary of success.
-                            msg.secondary := conf.secondary;
-                            sock.send(server(conf.secondary).sock.id,msg);
-                        } else if msg.secondary = self { 
+                        if msg.secondary = self { 
                             # This message was sent by a primary to notify us of a completed subscribe.
                             #debug "secondary recv'd ACK" with self=self, primary=conf.primary, secondary=conf.secondary, key=msg.key, client=msg.src_client;
-                            if conf.secondary = self {
-                                # The primary ACK'd this subscribe, so we're safe to complete it.
+                            if conf.secondary = self | conf.primary = self {
+                                # If we're the secondary, the primary ACK'd this subscribe, so we're safe to complete it.
+                                # If we're the primary, we must have been promoted before receiving the ACK, so we need to complete the operation.
                                 var chan := table.get(msg.key);
                                 chan.pending_subs := chan.pending_subs.remove(msg.src_client);
                                 chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
                                 table.set(msg.key,chan);
-                            } else if conf.primary = self {
-                                # Captured by an above case.
                             } else {
                                 # I'm no longer the secondary, in which case, the new secondary should have inherited 
                                 # the subscription from the primary, and we're all clear to drop this ACK.
+                            }
+                        } else if conf.primary = self { 
+                            # I am the original primary.
+                            if conf.secondary ~= msg.secondary {
+                                # The secondary has changed, so we need to retry the operation.
+                                # If the new secondary receives this as the new secondary, it will complete it normally.
+                                # Else, the new secondary receives this as the new primary and will retry.
+                                #debug "still primary, retrying" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
+                                msg.secondary := conf.secondary;
+                                msg.kind := sub_req_kind;
+                                sock.send(server(conf.secondary).sock.id,msg);
+                            } else {
+                                # The secondary received the subscribe, so we're safe to complete.
+                                #debug "primary received response from secondary, completing" with primary=self, secondary=conf.secondary, key=msg.key, client=msg.src_client;
+                                var chan := table.get(msg.key);
+                                chan.clients_subscribed := chan.clients_subscribed.add(msg.src_client);
+                                chan.pending_subs := chan.pending_subs.remove(msg.src_client);
+                                table.set(msg.key,chan);
+                                # Catch the client up on any new messages.
+                                var idx : index; idx := 0;
+                                var log_size := msg.log.size();
+                                while idx < last_pub(msg.key) {
+                                    if idx >= log_size {
+                                        msg.log := msg.log.append(chan.log.get(idx));
+                                    }
+                                    idx := idx.next;
+                                }
+                                sock.send(client(msg.src_client).sock.id,msg);
+                                # Notify the secondary of success.
+                                msg.secondary := conf.secondary;
+                                sock.send(server(conf.secondary).sock.id,msg);
                             }
                         } else {
                             #debug "got reassigned, notifying primary to retry" with primary=conf.primary, key=msg.key, client=msg.src_client;
@@ -527,17 +509,38 @@ process client (self:client_id) = {
                         # Forward to the client.
                         sock.send(client(msg.src_client).sock.id,msg);
                     } else if msg.kind = pub_req_kind {
+                        # Here's a race condition:
+                        # The primary accepts a publication request, and forwards to secondary.
+                        # Before the request arrives at the secondary, the secondary gets promoted and starts handling new pubs.
+                        # Now, when the request arrives at the new primary, it may be committed after newer requests. 
+                        # Solution: primary will only handle pub reqs if their client_idx is greater than the max for this client.
                         var conf := confmap.get(msg.key);
                         var chan := table.get(msg.key);
-                        if conf.primary = self & chan.pending_subs.size = 0 {
+                        if conf.primary = self {
                             # Only allow publications if we've dealt with all pending subscriptions from previous views.
-                            chan.log := chan.log.append(msg.val);
-                            table.set(msg.key,chan);
-                            sock.send(server(conf.secondary).sock.id,msg);
-                            # Receiving this request has serialized its order.
-                            serialize(msg.key,self,conf.secondary,msg.src_client,msg.val.data);
+                            if chan.pending_subs.size = 0 {
+                                # Prevent zombie requests from earlier views from breaking sequential consistency.
+                                if msg.val.client_idx > max_client_idx(msg.key) {
+                                    max_client_idx(msg.key) := msg.val.client_idx;
+                                    if chan.log.size = 0 {
+                                        msg.val.idx := 0;
+                                    } else {
+                                        msg.val.idx := chan.log.get(chan.log.size-1).idx.next;
+                                    }
+                                    chan.log := chan.log.append(msg.val);
+                                    table.set(msg.key,chan);
+                                    sock.send(server(conf.secondary).sock.id,msg);
+                                    # Receiving this request has serialized its order.
+                                    serialize(msg.key,self,conf.secondary,msg.src_client,msg.val);
+                                }
+                            }
                         } else if conf.secondary = self & ~conf.replicating{
                             if src = server(conf.primary).sock.id {
+                                if chan.log.size = 0 {
+                                    msg.val.idx := 0;
+                                } else {
+                                    msg.val.idx := chan.log.get(chan.log.size-1).idx.next;
+                                }
                                 chan.log := chan.log.append(msg.val);
                                 table.set(msg.key,chan);
                                 msg.log := chan.log; # only used for tracking purposes, not actually used by clients.
@@ -633,10 +636,11 @@ process client (self:client_id) = {
                 specification {
                     # Keeps track of publish requests serialized at the primary, 
                     # but not committed by the secondary.
-                    instance serialized(K:key_t,C:client_id) : unbounded_queue(data_t)
+                    instance serialized(K:key_t,C:client_id) : unbounded_queue(val_t)
 
                     # Called by the secondary to commit a publish.
                     action commit_one(k:key_t,src_client:client_id) = {
+                        debug "commit_one" with key=k, secondary=self;
                         if ~serialized(k,src_client).empty {
                             commit(k,src_client,serialized(k,src_client).dequeue);
                         }
@@ -651,23 +655,22 @@ process client (self:client_id) = {
                         }
 
                         # This request has arrived at the primary, meaning its relative order is fixed/serialized.
-                        action serialize(k:key_t,primary:server_id,secondary:server_id,src_client:client_id,data:data_t) = {
+                        action serialize(k:key_t,primary:server_id,secondary:server_id,src_client:client_id,val:val_t) = {
+                            debug "serialize" with key=k, primary=primary, secondary=secondary, val=val;
                             if primary = true_primary(k) {
-                                serialized(secondary,k,src_client).enqueue(data);
+                                serialized(secondary,k,src_client).enqueue(val);
                             }
                         }
 
                         # After replicating, this ghost action is called to dequeue outstanding publishes.
-                        #   Note that these outstanding publishes are not committed here- 
-                        #   they will be committed by the new secondary.
-                        #   This ensures that a publication is only committed once.
                         action commit_all_serialized(k:key_t,self:server_id,secondary:server_id) = {
+                            debug "commit_all_serialized" with key=k, primary=self, secondary=secondary;
                             for it,src_client in client_id.iter {
                                 while ~serialized(secondary,k,src_client).empty 
                                 decreases serialized(secondary,k,src_client).tail - serialized(secondary,k,src_client).head {
-                                    var data := serialized(secondary,k,src_client).dequeue;
+                                    var val := serialized(secondary,k,src_client).dequeue;
                                     if self = true_primary(k) {
-                                        commit(k,src_client,data);
+                                        commit(k,src_client,val);
                                     }
                                 }
                             }
@@ -684,6 +687,7 @@ process client (self:client_id) = {
 
         # Client state.
         instance confmap : delegation_map(key_t,config)
+        var private_pub_num(K:key_t) : pub_id           # the number of publication requests for this client
 
         # Cliet network sockets.
         instance sock : net.socket
@@ -721,6 +725,8 @@ process client (self:client_id) = {
             var val : val_t;
             val.data := data;
             val.src := self;
+            val.client_idx := private_pub_num(key);
+            private_pub_num(key) := private_pub_num(key).next;
             var msg : msg_t;
             msg.kind := pub_req_kind;
             msg.src_client := self;
